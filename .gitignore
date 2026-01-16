@@ -1,0 +1,13 @@
+.vscode
+.idea
+.DS_Store
+.claude
+.codex
+.gemini
+__pycache__/
+*.pyc
+Residual-Perception-Preprocessor/
+rd.md
+update.md
+doc.md
+data/

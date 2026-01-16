@@ -1,0 +1,105 @@
+# HLP - High Level Policy 配置文件
+# 所有参数都有默认值，此处可覆盖修改
+
+# ========== table_corners: 视角变换角点坐标 ==========
+# 表示224x224主相机图像上table区域的4个角点坐标
+# 按左上、右上、右下、左下顺序排列
+# 这4个点围成的四边形将被透视变换到224x224的table俯视视角
+# 可通过 calibrate.py 工具标定生成
+#
+# 默认值为整个图像的4个角点（即无变换）:
+# table_corners:
+#   - [0.0, 0.0]        # 左上
+#   - [223.0, 0.0]      # 右上
+#   - [223.0, 223.0]    # 右下
+#   - [0.0, 223.0]      # 左下
+
+table_corners:
+  - [82.0, 45.0]        # 左上
+  - [150.0, 44.0]        # 右上
+  - [164.0, 158.0]        # 右下
+  - [73.0, 161.0]        # 左下
+
+# ========== 通用调试配置 ==========
+debug:
+  save_intermediate: true    # 是否保存中间产物到磁盘
+  return_intermediate: false # 是否把中间数组也塞进 result["debug"]（注意内存）
+
+# ========== M1: 主相机矫正 + 红色积木分割 ==========
+m1:
+  # 红色HSV双区间阈值（H在OpenCV中范围是0-180）
+  hsv_red_low1: [0, 120, 60]       # 区间1下界: H∈[0,10], S≥120, V≥60
+  hsv_red_high1: [10, 255, 255]    # 区间1上界
+  hsv_red_low2: [170, 120, 60]     # 区间2下界: H∈[170,180]
+  hsv_red_high2: [180, 255, 255]   # 区间2上界
+
+  # 形态学操作参数
+  morph_kernel_shape: "ellipse"    # 核形状（固定为ellipse）
+  morph_kernel_size: 3             # 核大小 (3,3)
+  morph_open_iter: 1               # 开运算迭代次数
+  morph_close_iter: 1              # 闭运算迭代次数
+
+# ========== M2: 目标对齐优化 ==========
+m2:
+  # 差分进化优化器参数
+  seed: 0                          # 随机种子（确保可复现）
+  maxiter: 30                      # 最大迭代次数
+  popsize: 10                      # 种群大小
+  tol: 0.001                       # 收敛容差
+
+  # 目标函数权重
+  lambda1: 0.6                     # C_fill（目标区域缺失积木）权重
+  lambda2: 0.4                     # C_remove（目标区域外积木）权重
+
+  # 变换参数约束
+  bounds:
+    tx: 18.0                       # 平移x范围 [-18, 18]
+    ty: 18.0                       # 平移y范围 [-18, 18]
+    theta_deg: 8.0                 # 旋转角度范围 [-8, 8] 度
+    scale_low: 0.92                # 缩放下界
+    scale_high: 1.08               # 缩放上界
+
+  force_reopt_each_step: false     # 是否每步强制重新优化（true会禁用缓存）
+  workers: 1                       # 并行工作数（1为确定性，>1可能更快但不确定）
+  updating: "deferred"             # 更新策略
+
+# ========== M3: 障碍感知测地线距离场 + Flow Field ==========
+m3:
+  bfs_connectivity: 4              # BFS连通性（固定为4邻域）
+  obstacle_fill_dist_margin: 5.0   # 障碍填充距离边缘值
+  sobel_ksize: 3                   # Sobel算子核大小
+
+# ========== M4: 方向离散化 + 连通域切分 ==========
+m4:
+  lambda_h: 1.2                    # 水平偏置系数（必须>1，越大越倾向水平）
+  mag_min: 0.001                   # 最小梯度模长阈值
+  A_min: 60                        # 最小面积阈值（像素）
+  H_min: 18                        # 切分后最小高度
+  H_max: 42                        # 触发切分的最大高度
+  opening_kernel_size: 3           # 开运算核大小
+  opening_iter: 1                  # 开运算迭代次数
+
+# ========== M5: 选择 + 反变换 + 叠加可视化 ==========
+m5:
+  overlay_alpha: 0.35              # 叠加透明度 (0,1)
+
+  # 方向颜色（BGR格式）
+  color_up: [255, 0, 0]            # 向上: 蓝色
+  color_down: [0, 0, 255]          # 向下: 红色
+  color_left: [0, 255, 255]        # 向左: 黄色
+  color_right: [0, 255, 0]         # 向右: 绿色
+
+# ========== I/O 配置 ==========
+io:
+  save_m4_masks: true              # 是否保存M4的masks
+  save_m5_overlay: true            # 是否保存M5的叠加图
+  save_m1: true                    # 是否保存M1的输出
+  save_m2: true                    # 是否保存M2的输出
+  save_m3: true                    # 是否保存M3的输出
+  mkdir_exist_ok: true             # 创建目录时是否允许已存在
+
+# ========== 日志配置 ==========
+log:
+  level: "INFO"                    # 日志级别: DEBUG, INFO, WARNING, ERROR
+  structured: true                 # 是否输出结构化JSON日志
+  print_to_console: true           # 是否打印到控制台

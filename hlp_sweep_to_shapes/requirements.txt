@@ -1,0 +1,7 @@
+# HLP - High Level Policy 依赖
+# Python >= 3.10
+
+numpy>=1.23
+opencv-python>=4.8
+scipy>=1.10
+pyyaml>=6.0
