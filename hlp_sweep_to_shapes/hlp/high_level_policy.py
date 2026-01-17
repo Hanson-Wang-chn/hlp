@@ -8,6 +8,7 @@ High Level Policy 顶层类
 import time
 import logging
 import numpy as np
+import cv2
 from typing import Dict, Any, Optional
 
 from .types import ImgBGR, ImgBin01, ImgBin255, Mat33, HLPResult
@@ -18,7 +19,7 @@ from .io_utils import (
     ensure_dir, save_u8_png, bin01_to_255, float01_to_u8, hash_bin01
 )
 from .m1_rectify_segment import m1_run
-from .m2_align_goal import m2_run, m2_normalize_goal_to01, m2_warp_goal
+from .m2_align_goal import m2_run, m2_normalize_goal_to01, m2_prepare_pile_mask, m2_warp_goal
 from .m3_flow_field import m3_run
 from .m4_chunker import m4_run
 from .m5_select_overlay import m5_run
@@ -71,6 +72,9 @@ class HighLevelPolicy:
             self.table_corners = get_table_corners_from_cfg(self.cfg)
             self.T1, self.T1_inv = compute_perspective_transforms(self.table_corners)
 
+        # 目标处理配置
+        self.use_T1_for_goal = bool(self.cfg["goal"].get("use_T1_for_goal", False))
+
         # 初始化缓存
         self.cache = GoalCache()
 
@@ -93,8 +97,26 @@ class HighLevelPolicy:
         if new_goal_bin_table is not None:
             # 标准化并缓存
             goal_01 = m2_normalize_goal_to01(new_goal_bin_table)
-            goal_hash = hash_bin01(goal_01)
+            goal_effective_01 = self._warp_goal_with_T1(goal_01) if self.use_T1_for_goal else goal_01
+            goal_hash = hash_bin01(goal_effective_01)
             self.cache.goal_hash = goal_hash
+
+    def _warp_goal_with_T1(self, goal_01: np.ndarray) -> np.ndarray:
+        """
+        将目标mask经过T1变换到table视角，保持0/1格式
+        """
+        if self.T1 is None:
+            return goal_01
+
+        warped = cv2.warpPerspective(
+            goal_01.astype(np.float32),
+            self.T1,
+            (224, 224),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        return (warped > 0.5).astype(np.uint8)
 
     def infer(
         self,
@@ -148,8 +170,9 @@ class HighLevelPolicy:
             if save_dir and self.cfg["debug"]["save_intermediate"]:
                 ensure_dir(save_dir, exist_ok=self.cfg["io"]["mkdir_exist_ok"])
 
-            # 标准化目标图像为0/1
-            goal_01 = m2_normalize_goal_to01(img_bin_table_goal_224)
+            # 标准化目标图像为0/1，按需经过T1变换到table视角
+            goal_01_raw = m2_normalize_goal_to01(img_bin_table_goal_224)
+            goal_01 = self._warp_goal_with_T1(goal_01_raw) if self.use_T1_for_goal else goal_01_raw
             goal_hash = hash_bin01(goal_01)
 
             # ==================== M1: 矫正 + 分割 ====================
@@ -183,19 +206,21 @@ class HighLevelPolicy:
                 hlp_logger.cache_hit("M2", step_id)
                 G_01 = self.cache.mask_table_goal_01
                 T2 = self.cache.T2
-                J_best = 0.0  # 缓存时不重新计算
+                J_best = float("nan")  # 缓存时不重新计算
                 m2_stats = {}
             else:
                 # 重新优化
                 hlp_logger.cache_miss("M2", step_id)
-                G_01, _, T2, J_best, m2_stats = m2_run(
+                G_01, residual_01, T2, J_best, m2_stats = m2_run(
                     B_01, goal_01, self.cfg["m2"]
                 )
                 # 更新缓存
                 self.cache.update_m2_cache(goal_hash, T2, G_01)
 
-            # residual每步必须重算（因为B会变）
-            residual_01 = np.logical_and(B_01 == 1, G_01 == 0).astype(np.uint8)
+            # residual每步必须重算（因为B会变）；同步RPP：使用M2内部同款pile平滑逻辑
+            if m2_hit:
+                pile_mask_m2 = m2_prepare_pile_mask(B_01, self.cfg["m2"])
+                residual_01 = (pile_mask_m2.astype(bool) & (~G_01.astype(bool))).astype(np.uint8)
 
             meta["cache"]["m2_hit"] = m2_hit
             m2_elapsed = hlp_logger.end(
@@ -212,6 +237,8 @@ class HighLevelPolicy:
             if save_dir and self.cfg["io"]["save_m2"]:
                 m2_dir = f"{save_dir}/m2"
                 ensure_dir(m2_dir)
+                if self.use_T1_for_goal:
+                    save_u8_png(f"{m2_dir}/mask_table_goal_t1.png", bin01_to_255(goal_01))
                 save_u8_png(f"{m2_dir}/mask_table_goal.png", bin01_to_255(G_01))
                 save_u8_png(f"{m2_dir}/mask_table_residual.png", bin01_to_255(residual_01))
 
@@ -339,6 +366,7 @@ class HighLevelPolicy:
                 debug_dict.update({
                     "img_rgb_table": img_rgb_table,
                     "B_01": B_01,
+                    "goal_01_effective": goal_01,
                     "G_01": G_01,
                     "residual_01": residual_01,
                     "dist_norm": dist_norm,

@@ -1,12 +1,12 @@
 # HLP - High Level Policy for Sweep to Shapes
 
-**版本: 1.2.0**
+**版本: 2.2**
 
 ## 项目简介
 
 本项目实现了用于 "Sweep to Shapes" 任务的高层策略（High Level Policy, HLP）。该任务面向真机双臂毛刷协同场景：桌面（30cm×30cm 正方形框）内有大量最小号乐高积木（红色），目标是通过多次直线 sweep 将积木"扫出"指定的目标图案（如字母/数字/简单图案），使方框内最终仅保留目标形状区域的积木。
 
-HLP 的职责是在每一步（每次 sweep 动作之前）根据**当前主相机图像**与**二值目标图像（table 视角）**，生成下一次最应该执行的 **sweep 区域 mask** 及其方向，并输出一个用于 LLP/VLA 的可视化叠加图（224×224）。
+HLP 的职责是在每一步（每次 sweep 动作之前）根据**当前主相机图像**与**二值目标图像**，生成下一次最应该执行的 **sweep 区域 mask** 及其方向，并输出一个用于 LLP/VLA 的可视化叠加图（224×224）。如需让目标图在进入 T2 对齐前先按 `table_corners` 经过透视变换 T1 矫正，可在配置中开启 `goal.use_T1_for_goal`（默认关闭，保持旧逻辑）。
 
 ## 系统要求
 
@@ -231,6 +231,13 @@ table_corners:
   - [0.0, 223.0]      # 左下
 ```
 
+### 目标处理 (goal)
+
+```yaml
+goal:
+  use_T1_for_goal: false   # 是否在进入M2前先对目标mask应用T1透视，默认false保持旧逻辑
+```
+
 ### 调试配置 (debug)
 
 ```yaml
@@ -257,19 +264,44 @@ m1:
 
 ### M2: 目标对齐优化 (m2)
 
+M2 配置已合并进单个 `config.yaml` 文件（顶层 `m2:`），默认值与 Residual-Perception-Preprocessor 保持一致：
+
 ```yaml
 m2:
-  seed: 0                    # 随机种子
-  maxiter: 30                # 最大迭代次数
-  popsize: 10                # 种群大小
-  lambda1: 0.6               # C_fill权重
-  lambda2: 0.4               # C_remove权重
-  bounds:
-    tx: 18.0                 # 平移范围
-    ty: 18.0
-    theta_deg: 8.0           # 旋转范围（度）
-    scale_low: 0.92          # 缩放范围
-    scale_high: 1.08
+  optimizer: "differential_evolution"
+  lambda_fill: 2.0
+  lambda_remove: 1.0
+  lambda_edge: 0.0
+  lambda_sweep: 0.0
+
+  reg_tx: 2
+  reg_ty: 2
+  reg_theta: 1
+  reg_scale: 0.0
+  reg_scale_ref: 1.0
+
+  sigma_edge: 10.0
+  alpha_sweep: 2.0
+
+  scale_min: 0.8
+  scale_max: 1.2
+  tx_abs_max: 20.0
+  ty_abs_max: 20.0
+  theta_range:
+    - -0.1
+    - 0.1
+
+  smooth_kernel: 5
+  smooth_sigma: 2.0
+  smooth_morph_iterations: 2
+  smooth_use_closing: true
+  smooth_use_opening: true
+
+  maxiter: 1000
+  seed: 42
+  grid_resolution: 20000
+  local_maxiter: 2000
+  force_reopt_each_step: true
 ```
 
 ### M3: Flow Field (m3)
@@ -309,7 +341,7 @@ m5:
 hlp_sweep_to_shapes/
 ├── README.md                    # 本文档
 ├── requirements.txt             # 依赖列表
-├── config.yaml                  # 默认配置文件
+├── config.yaml                  # 默认配置文件（包含所有模块配置）
 ├── calibrate.py                 # 视角变换标定工具（Gradio界面）
 │
 ├── hlp/                         # 核心模块
@@ -345,7 +377,7 @@ HLP 每次推理按以下流程执行：
 
 1. **M1 (矫正+分割)**：主相机图像 → table平面矫正 → HSV红色积木分割 → `img_bin_table_cur`
 
-2. **M2 (目标对齐)**：优化相似变换T2 → 得到 `mask_table_goal` 和 `mask_table_residual`
+2. **目标矫正(可选) + M2 (目标对齐)**：若开启 `goal.use_T1_for_goal`，则目标二值图先使用与主相机相同的 T1 透视到 table 视角；随后优化相似变换 T2 → 得到 `mask_table_goal` 和 `mask_table_residual`
 
 3. **M3 (Flow Field)**：以goal为障碍计算测地线距离场 → Sobel梯度 → `map_grad`
 
@@ -395,6 +427,7 @@ HLP 每次推理按以下流程执行：
 │   ├── img_rgb_table_cur.png    # 矫正后的table视角图像
 │   └── img_bin_table_cur.png    # 红色积木分割结果
 ├── m2/
+│   ├── mask_table_goal_t1.png   # 目标图经过T1矫正后的mask（仅在 goal.use_T1_for_goal=true 时保存）
 │   ├── mask_table_goal.png      # 对齐后的目标mask
 │   └── mask_table_residual.png  # 需要扫除的区域
 ├── m3/
@@ -417,6 +450,33 @@ HLP 每次推理按以下流程执行：
 5. **缓存机制**：M2和M3的结果会被缓存，相同goal时可复用
 
 ## 版本历史
+
+### v2.2
+- 合并 `config_m2.yaml` 到 `config.yaml`，仅保留单一配置文件且运行逻辑保持不变
+- 配置加载逻辑简化为单文件读取（仍兼容仅包含 `m2` 键的 YAML）
+- 更新文档版本标记至 2.2，并调整 M2 配置说明与项目结构
+
+### v2.1
+- M2 代价函数新增参数正则化项（平移/旋转/缩放分别可独立加权），配置项 `reg_tx/reg_ty/reg_theta/reg_scale/reg_scale_ref` 已加入 `config_m2.yaml` 与默认配置
+- 更新文档版本标记至 2.1，并补充 M2 配置说明
+
+### v2.0
+- 新增 `goal.use_T1_for_goal` 开关控制目标二值图是否在进入 T2 前先经过 T1 矫正（默认关闭，保持旧逻辑）
+- 开启时会保存 `m2/mask_table_goal_t1.png` 便于排查
+- M2 支持通过 `tx_abs_max`/`ty_abs_max` 限制平移范围，优化初始值固定为中心、旋转0、缩放1
+- 文档版本标记更新为 2.0
+
+### v1.5.0
+- **M2 模块重写**：完全同步 Residual-Perception-Preprocessor (RPP) 的目标对齐优化算法
+- 新增 `m2_align_goal.py` 模块，包含：
+  - `TransformParams` 数据类：变换参数 (tx, ty, theta, scale)
+  - `CostFunction` 类：完整的代价函数 J(T) = λ1·C_fill + λ2·C_remove + λ3·C_edge + λ4·C_sweep
+  - 4种优化器：GridSearch、Scipy (L-BFGS-B)、DifferentialEvolution、Hybrid
+  - `MaskSmoother` 预处理：形态学闭/开运算 + Gaussian blur
+- 新增 `config_m2.yaml` 独立配置文件，参数与 RPP 完全一致
+- 默认优化器改为 `differential_evolution`（与 RPP 默认一致）
+- 新增 `force_reopt_each_step` 配置项，控制是否每步重新优化
+- 确保 HLP M2 与 RPP 对于相同输入产生一致的输出
 
 ### v1.2.0
 - **重大更新**：使用 `table_corners`（4个角点坐标）替代直接配置 T1 矩阵

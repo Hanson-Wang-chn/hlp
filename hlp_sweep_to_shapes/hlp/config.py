@@ -6,6 +6,7 @@
 
 import copy
 import numpy as np
+from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
 # ========== 默认配置 ==========
@@ -27,41 +28,83 @@ DEFAULT_CFG: Dict[str, Any] = dict(
         return_intermediate=False,  # 是否把中间数组也塞进 result["debug"]（注意内存）
     ),
 
+    # ---------- 目标处理配置 ----------
+    goal=dict(
+        use_T1_for_goal=False,      # 是否在进入M2前先对目标mask应用T1透视（默认关闭，保持旧逻辑）
+    ),
+
     # ---------- M1: 主相机矫正 + 红色积木分割 ----------
     m1=dict(
         hsv_red_low1=(0, 120, 60),       # 红色HSV下界1
         hsv_red_high1=(10, 255, 255),    # 红色HSV上界1
         hsv_red_low2=(170, 120, 60),     # 红色HSV下界2
         hsv_red_high2=(180, 255, 255),   # 红色HSV上界2
-        morph_kernel_shape="ellipse",    # 形态学核形状（固定为ellipse）
+        morph_kernel_shape="ellipse",    # 形态学核形状：ellipse/rect/cross
         morph_kernel_size=3,             # 形态学核大小 (3,3)
         morph_open_iter=1,               # 开运算迭代次数
         morph_close_iter=1,              # 闭运算迭代次数
     ),
 
     # ---------- M2: 目标对齐优化 ----------
+    # 完全同步自 Residual-Perception-Preprocessor/hlp_preprocessor.py
     m2=dict(
-        seed=0,                          # 随机种子
-        maxiter=30,                      # 最大迭代次数
-        popsize=10,                      # 种群大小
-        tol=1e-3,                        # 收敛容差
-        lambda1=0.6,                     # C_fill 权重
-        lambda2=0.4,                     # C_remove 权重
+        # 优化器选择
+        optimizer="differential_evolution",  # "hybrid", "grid", "scipy", "differential_evolution"
+
+        # 代价函数权重
+        # J(T) = λ1·C_fill + λ2·C_remove + λ3·C_edge + λ4·C_sweep
+        # 默认值与 Residual-Perception-Preprocessor/config/config.yaml 保持一致
+        lambda_fill=2.0,                 # λ1: C_fill权重
+        lambda_remove=1.0,               # λ2: C_remove权重
+        lambda_edge=0.0,                 # λ3: C_edge权重
+        lambda_sweep=0.0,                # λ4: C_sweep权重
+
+        # 变换参数正则化权重（Reg(T) = Σ ρ · Δ²）
+        reg_tx=0.0,                      # ρ_tx: 平移tx惩罚系数
+        reg_ty=0.0,                      # ρ_ty: 平移ty惩罚系数
+        reg_theta=0.0,                   # ρ_theta: 旋转角度惩罚系数
+        reg_scale=0.0,                   # ρ_scale: 缩放偏离参考值的惩罚系数
+        reg_scale_ref=1.0,               # 缩放正则参考值（通常为1.0）
+
+        # 扩展代价参数
+        sigma_edge=10.0,                 # 边缘代价高斯核σ
+        alpha_sweep=2.0,                 # 扫除代价距离场指数
+
+        # 积木堆mask平滑（用于M2优化与residual计算；同步RPP的MaskSmoother）
+        smooth_kernel=5,                 # 形态学核大小（奇数）
+        smooth_sigma=2.0,                # Gaussian blur sigma
+        smooth_morph_iterations=2,       # closing/opening迭代次数
+        smooth_use_closing=True,
+        smooth_use_opening=True,
+
+        # 混合优化参数
+        grid_resolution=20000,           # 网格搜索分辨率（与 RPP config 默认保持一致）
+        local_maxiter=2000,              # L-BFGS-B最大迭代次数
+
+        # 差分进化参数
+        maxiter=1000,                    # 差分进化最大迭代次数
+        seed=42,                         # 随机种子
+
+        # 变换参数约束
+        theta_range=[-np.pi/4, np.pi/4], # 旋转角度范围（弧度）
+        # 与RPP配置对齐的缩放范围字段（保留bounds以向后兼容）
+        scale_min=0.3,
+        scale_max=1.5,
+        tx_abs_max=None,                # 平移范围（像素），None时使用默认范围
+        ty_abs_max=None,
         bounds=dict(
-            tx=18.0,                     # 平移x范围 [-18, 18]
-            ty=18.0,                     # 平移y范围 [-18, 18]
-            theta_deg=8.0,               # 旋转角度范围 [-8, 8] 度
-            scale_low=0.92,              # 缩放下界
-            scale_high=1.08,             # 缩放上界
+            scale_low=0.3,               # [兼容] 缩放下界
+            scale_high=1.5,              # [兼容] 缩放上界
         ),
-        force_reopt_each_step=False,     # 是否每步强制重新优化
-        workers=1,                       # 并行工作数（1为确定性）
-        updating="deferred",             # 更新策略
+
+        # 缓存控制
+        # RPP每次process都会重新优化；HLP侧默认也改为每步重算以保证一致性
+        force_reopt_each_step=True,      # 是否每步强制重新优化
     ),
 
     # ---------- M3: 障碍感知测地线距离场 + Flow Field ----------
     m3=dict(
-        bfs_connectivity=4,              # BFS连通性（固定为4邻域）
+        bfs_connectivity=4,              # BFS连通性（4或8）
         obstacle_fill_dist_margin=5.0,   # 障碍填充距离边缘值
         sobel_ksize=3,                   # Sobel算子核大小
     ),
@@ -134,19 +177,65 @@ def validate_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     # ========== 参数范围校验 ==========
 
-    # M2: lambda1 + lambda2 应该为正数
-    if result["m2"]["lambda1"] < 0:
-        raise ValueError("m2.lambda1 必须 >= 0")
-    if result["m2"]["lambda2"] < 0:
-        raise ValueError("m2.lambda2 必须 >= 0")
-    if result["m2"]["lambda1"] + result["m2"]["lambda2"] <= 0:
-        raise ValueError("m2.lambda1 + m2.lambda2 必须 > 0")
+    # M2: 代价函数权重校验
+    if result["m2"]["lambda_fill"] < 0:
+        raise ValueError("m2.lambda_fill 必须 >= 0")
+    if result["m2"]["lambda_remove"] < 0:
+        raise ValueError("m2.lambda_remove 必须 >= 0")
+    if result["m2"]["lambda_fill"] + result["m2"]["lambda_remove"] <= 0:
+        raise ValueError("m2.lambda_fill + m2.lambda_remove 必须 > 0")
+    for key in ("reg_tx", "reg_ty", "reg_theta", "reg_scale"):
+        if result["m2"][key] < 0:
+            raise ValueError(f"m2.{key} 必须 >= 0")
+
+    # M2: 优化器类型校验
+    valid_optimizers = ["hybrid", "grid", "scipy", "differential_evolution"]
+    if result["m2"]["optimizer"] not in valid_optimizers:
+        raise ValueError(f"m2.optimizer 必须是 {valid_optimizers} 之一")
 
     # M2: bounds 校验
-    if result["m2"]["bounds"]["scale_low"] >= result["m2"]["bounds"]["scale_high"]:
-        raise ValueError("m2.bounds.scale_low 必须 < m2.bounds.scale_high")
-    if result["m2"]["bounds"]["scale_low"] <= 0:
-        raise ValueError("m2.bounds.scale_low 必须 > 0")
+    # 兼容字段映射：bounds.scale_low/high -> scale_min/max
+    if "scale_min" not in result["m2"] or result["m2"]["scale_min"] is None:
+        result["m2"]["scale_min"] = result["m2"]["bounds"].get("scale_low", 0.3)
+    if "scale_max" not in result["m2"] or result["m2"]["scale_max"] is None:
+        result["m2"]["scale_max"] = result["m2"]["bounds"].get("scale_high", 1.5)
+
+    # 反向回填，保证外部仍可读取bounds字段
+    result["m2"]["bounds"]["scale_low"] = float(result["m2"]["scale_min"])
+    result["m2"]["bounds"]["scale_high"] = float(result["m2"]["scale_max"])
+
+    if result["m2"]["scale_min"] >= result["m2"]["scale_max"]:
+        raise ValueError("m2.scale_min 必须 < m2.scale_max")
+    if result["m2"]["scale_min"] <= 0:
+        raise ValueError("m2.scale_min 必须 > 0")
+
+    # M2: 其他参数校验
+    if result["m2"]["sigma_edge"] <= 0:
+        raise ValueError("m2.sigma_edge 必须 > 0")
+    if result["m2"]["grid_resolution"] < 1:
+        raise ValueError("m2.grid_resolution 必须 >= 1")
+    if result["m2"]["smooth_kernel"] is not None and result["m2"]["smooth_kernel"] > 0:
+        if result["m2"]["smooth_kernel"] % 2 == 0:
+            raise ValueError("m2.smooth_kernel 必须为奇数")
+        if result["m2"]["smooth_kernel"] < 3:
+            raise ValueError("m2.smooth_kernel 必须 >= 3")
+    if result["m2"]["smooth_sigma"] < 0:
+        raise ValueError("m2.smooth_sigma 必须 >= 0")
+    if result["m2"]["smooth_morph_iterations"] < 0:
+        raise ValueError("m2.smooth_morph_iterations 必须 >= 0")
+    if result["m2"]["tx_abs_max"] is not None and result["m2"]["tx_abs_max"] < 0:
+        raise ValueError("m2.tx_abs_max 必须 >= 0 或为 null")
+    if result["m2"]["ty_abs_max"] is not None and result["m2"]["ty_abs_max"] < 0:
+        raise ValueError("m2.ty_abs_max 必须 >= 0 或为 null")
+
+    # M1: morph_kernel_shape 合法性校验
+    valid_kernel_shapes = ["ellipse", "rect", "cross"]
+    if result["m1"]["morph_kernel_shape"] not in valid_kernel_shapes:
+        raise ValueError(f"m1.morph_kernel_shape 必须是 {valid_kernel_shapes} 之一")
+
+    # M3: bfs_connectivity 合法性校验
+    if result["m3"]["bfs_connectivity"] not in (4, 8):
+        raise ValueError("m3.bfs_connectivity 只能是 4 或 8")
 
     # M4: lambda_h 必须 > 1
     if result["m4"]["lambda_h"] <= 1.0:
@@ -168,7 +257,29 @@ def validate_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if result["m3"]["obstacle_fill_dist_margin"] <= 0:
         raise ValueError("m3.obstacle_fill_dist_margin 必须 > 0")
 
+    # goal: use_T1_for_goal 必须为bool
+    if not isinstance(result["goal"]["use_T1_for_goal"], bool):
+        raise ValueError("goal.use_T1_for_goal 必须是布尔值")
+
     return result
+
+
+def _to_nested_m2(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    将仅包含 M2 字段的扁平配置自动包装为嵌套结构
+    （便于直接加载仅包含 M2 键的配置文件）
+    """
+    if not cfg:
+        return {}
+
+    if "m2" in cfg:
+        return cfg
+
+    m2_keys = set(DEFAULT_CFG["m2"].keys())
+    if set(cfg.keys()).issubset(m2_keys):
+        return {"m2": cfg}
+
+    return cfg
 
 
 def load_cfg_from_yaml(yaml_path: str) -> Dict[str, Any]:
@@ -183,10 +294,23 @@ def load_cfg_from_yaml(yaml_path: str) -> Dict[str, Any]:
     """
     import yaml
 
-    with open(yaml_path, 'r', encoding='utf-8') as f:
-        user_cfg = yaml.safe_load(f) or {}
+    yaml_path = Path(yaml_path)
 
-    return validate_cfg(user_cfg)
+    def merge_dict(base: dict, override: dict) -> None:
+        for key, value in (override or {}).items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                merge_dict(base[key], value)
+            else:
+                base[key] = value
+
+    # 加载配置
+    with open(yaml_path, 'r', encoding='utf-8') as f:
+        user_cfg = _to_nested_m2(yaml.safe_load(f) or {})
+
+    merged_cfg: Dict[str, Any] = {}
+    merge_dict(merged_cfg, user_cfg)
+
+    return validate_cfg(merged_cfg)
 
 
 def get_table_corners_from_cfg(cfg: Dict[str, Any]) -> np.ndarray:

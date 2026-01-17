@@ -54,30 +54,24 @@ def m3_bfs_distance_obstacle_aware(goal_01: ImgBin01, cfg_m3: Dict[str, Any]) ->
             dist[y, W - 1] = 0
             q.append((y, W - 1))
 
-    # 4邻域BFS
+    connectivity = int(cfg_m3.get("bfs_connectivity", 4))
+    neighbor_shifts = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    if connectivity == 8:
+        neighbor_shifts.extend([
+            (-1, -1), (-1, 1),
+            (1, -1), (1, 1),
+        ])
+
+    # BFS
     while q:
         y, x = q.popleft()
         d = dist[y, x] + 1
 
-        # 上
-        if y > 0 and dist[y - 1, x] < 0 and goal_01[y - 1, x] == 0:
-            dist[y - 1, x] = d
-            q.append((y - 1, x))
-
-        # 下
-        if y + 1 < H and dist[y + 1, x] < 0 and goal_01[y + 1, x] == 0:
-            dist[y + 1, x] = d
-            q.append((y + 1, x))
-
-        # 左
-        if x > 0 and dist[y, x - 1] < 0 and goal_01[y, x - 1] == 0:
-            dist[y, x - 1] = d
-            q.append((y, x - 1))
-
-        # 右
-        if x + 1 < W and dist[y, x + 1] < 0 and goal_01[y, x + 1] == 0:
-            dist[y, x + 1] = d
-            q.append((y, x + 1))
+        for dy, dx in neighbor_shifts:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < H and 0 <= nx < W and dist[ny, nx] < 0 and goal_01[ny, nx] == 0:
+                dist[ny, nx] = d
+                q.append((ny, nx))
 
     return dist
 

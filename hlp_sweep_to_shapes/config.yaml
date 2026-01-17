@@ -25,6 +25,10 @@ debug:
   save_intermediate: true    # 是否保存中间产物到磁盘
   return_intermediate: false # 是否把中间数组也塞进 result["debug"]（注意内存）
 
+# ========== 目标处理配置 ==========
+goal:
+  use_T1_for_goal: false     # 是否在进入M2前先对目标mask应用T1透视（默认false保持旧逻辑）
+
 # ========== M1: 主相机矫正 + 红色积木分割 ==========
 m1:
   # 红色HSV双区间阈值（H在OpenCV中范围是0-180）
@@ -41,27 +45,49 @@ m1:
 
 # ========== M2: 目标对齐优化 ==========
 m2:
-  # 差分进化优化器参数
-  seed: 0                          # 随机种子（确保可复现）
-  maxiter: 30                      # 最大迭代次数
-  popsize: 10                      # 种群大小
-  tol: 0.001                       # 收敛容差
+  optimizer: "differential_evolution"  # 优化器类型
 
-  # 目标函数权重
-  lambda1: 0.6                     # C_fill（目标区域缺失积木）权重
-  lambda2: 0.4                     # C_remove（目标区域外积木）权重
+  # 代价函数权重
+  lambda_fill: 2.0
+  lambda_remove: 1.0
+  lambda_edge: 0.0
+  lambda_sweep: 0.0
+
+  # 变换参数正则化
+  reg_tx: 2
+  reg_ty: 2
+  reg_theta: 1
+  reg_scale: 0.0
+  reg_scale_ref: 1.0
+
+  # 扩展代价参数
+  sigma_edge: 10.0
+  alpha_sweep: 2.0
 
   # 变换参数约束
-  bounds:
-    tx: 18.0                       # 平移x范围 [-18, 18]
-    ty: 18.0                       # 平移y范围 [-18, 18]
-    theta_deg: 8.0                 # 旋转角度范围 [-8, 8] 度
-    scale_low: 0.92                # 缩放下界
-    scale_high: 1.08               # 缩放上界
+  scale_min: 0.8
+  scale_max: 1.2
+  tx_abs_max: 20.0
+  ty_abs_max: 20.0
+  theta_range:
+    - -0.01
+    - 0.01
 
-  force_reopt_each_step: false     # 是否每步强制重新优化（true会禁用缓存）
-  workers: 1                       # 并行工作数（1为确定性，>1可能更快但不确定）
-  updating: "deferred"             # 更新策略
+  # Mask 平滑
+  smooth_kernel: 5
+  smooth_sigma: 2.0
+  smooth_morph_iterations: 2
+  smooth_use_closing: true
+  smooth_use_opening: true
+
+  # 优化器细节
+  maxiter: 1000
+  seed: 42
+  grid_resolution: 20000
+  local_maxiter: 2000
+
+  # 缓存控制
+  force_reopt_each_step: true
 
 # ========== M3: 障碍感知测地线距离场 + Flow Field ==========
 m3:

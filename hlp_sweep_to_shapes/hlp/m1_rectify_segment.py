@@ -64,7 +64,14 @@ def m1_segment_red_blocks(img_rgb_table_cur_224: ImgBGR, cfg_m1: Dict[str, Any])
 
     # 形态学去噪
     k = cfg_m1["morph_kernel_size"]
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    shape_str = str(cfg_m1.get("morph_kernel_shape", "ellipse")).lower()
+    shape_map = {
+        "ellipse": cv2.MORPH_ELLIPSE,
+        "rect": cv2.MORPH_RECT,
+        "cross": cv2.MORPH_CROSS,
+    }
+    kernel_shape = shape_map.get(shape_str, cv2.MORPH_ELLIPSE)
+    kernel = cv2.getStructuringElement(kernel_shape, (k, k))
 
     # 开运算去除小噪点
     mask = cv2.morphologyEx(
